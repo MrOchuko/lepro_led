@@ -9,7 +9,7 @@ import os
 import hashlib
 import re
 import numpy as np
-from .const import DOMAIN, LOGIN_URL, FAMILY_LIST_URL, USER_PROFILE_URL, DEVICE_LIST_URL, SWITCH_API_URL
+from .const import DOMAIN, REGIONS, LOGIN_PATH, FAMILY_LIST_PATH, USER_PROFILE_PATH, DEVICE_LIST_PATH, SWITCH_API_PATH
 from aiomqtt import Client, MqttError
 import aiofiles
 from homeassistant.core import callback
@@ -108,7 +108,7 @@ class MQTTClientWrapper:
             except asyncio.CancelledError:
                 pass
 
-async def async_login(session, account, password, mac, language="it", fcm_token=""):
+async def async_login(session, account, password, mac, login_url, api_host, language="it", fcm_token=""):
     """Perform login and return bearer token."""
     timestamp = str(int(time.time()))
     payload = {
@@ -126,7 +126,7 @@ async def async_login(session, account, password, mac, language="it", fcm_token=
         "Device-Model": "custom_integration",
         "Device-System": "custom",
         "GMT": "+0",
-        "Host": "api-eu-iot.lepro.com",
+        "Host": api_host,
         "Language": language,
         "Platform": "2",
         "Screen-Size": "1536*2048",
@@ -135,8 +135,7 @@ async def async_login(session, account, password, mac, language="it", fcm_token=
         "User-Agent": "LE/1.0.9.202 (Custom Integration)",
     }
 
-    async with session.post(LOGIN_URL, json=payload, headers=headers) as resp:
-        import json
+    async with session.post(login_url, json=payload, headers=headers) as resp:
         if resp.status != 200:
             _LOGGER.error("Login failed with status %s", resp.status)
             return None
@@ -147,6 +146,45 @@ async def async_login(session, account, password, mac, language="it", fcm_token=
         token = data.get("data", {}).get("token")
         return token
 
+class DeviceCapabilities:
+    def __init__(
+        self,
+        segments: int = 0,
+        supports_color: bool = True,
+        supports_brightness: bool = True,
+        supports_ct: bool = False,
+        supports_special_effects: bool = True,
+    ):
+        self.segments = segments
+        self.supports_color = supports_color
+        self.supports_brightness = supports_brightness
+        self.supports_ct = supports_ct
+        self.supports_special_effects = supports_special_effects
+
+
+def build_capabilities(device: dict) -> DeviceCapabilities:
+    series = (device.get("series") or "").upper()
+    model = (device.get("model") or "").upper()
+
+    caps = DeviceCapabilities(segments=0)
+
+    # S1 AI segmented strips (your current main target)[web:11][web:17]
+    if "S1-5" in series or "S1" in series:
+        caps.segments =  25 # default to 25 if not specified    
+        caps.supports_special_effects = True
+
+    # Example for plain RGB strips (no segments) – adjust as you see real metadata
+    if "RGB" in series and "S1" not in series:
+        caps.segments = 0
+        caps.supports_special_effects = True
+
+    # Example CT‑only bulbs – again, refine once you inspect /device/list payloads[web:26]
+    if "CCT" in model or "CW" in series:
+        caps.supports_color = False
+        caps.supports_ct = True
+        caps.supports_special_effects = False
+
+    return caps
 
 class LeproLedLight(LightEntity):
     # Effect constants
@@ -182,8 +220,9 @@ class LeproLedLight(LightEntity):
     # Set of special effects for quick checks
     SPECIAL_EFFECTS = set(SPECIAL_EFFECT_TO_D60_PREFIX.keys())
     
-    def __init__(self, device, mqtt_client, entry_id):
+    def __init__(self, device, mqtt_client, entry_id,  caps: DeviceCapabilities):
         self._device = device
+        self._caps = caps
         # self._attr_name = device["name"]
         self._attr_unique_id = str(device["did"])
         self._fid = device["fid"]
@@ -204,7 +243,8 @@ class LeproLedLight(LightEntity):
         self._effect = self.EFFECT_SOLID
         self._speed = 50  # Default speed (0-100)
         # store 25 segments internally; main light mirrors segment 0
-        self._segment_colors = [(255, 255, 255)] * 25  # Default all white
+        seg_count = caps.segments if caps.segments > 0 else 1
+        self._segment_colors = [(255, 255, 255)] * seg_count  # Default all white
         self._sensitivity = 50  # For music mode
         
         # Initialize from device data
@@ -218,9 +258,20 @@ class LeproLedLight(LightEntity):
             self._sensitivity = self._parse_d60(device["d60"])
         
         # Entity attributes
+           # Supported features / modes
         self._attr_supported_features = LightEntityFeature.EFFECT
-        self._attr_color_mode = ColorMode.RGB
-        self._attr_supported_color_modes = {ColorMode.RGB}
+
+        if self._caps.supports_color:
+            self._attr_color_mode = ColorMode.RGB
+            self._attr_supported_color_modes = {ColorMode.RGB}
+        elif self._caps.supports_ct:
+            self._attr_color_mode = ColorMode.COLOR_TEMP
+            self._attr_supported_color_modes = {ColorMode.COLOR_TEMP}
+        else:
+            self._attr_color_mode = ColorMode.BRIGHTNESS
+            self._attr_supported_color_modes = {ColorMode.BRIGHTNESS}
+
+
         self._attr_effect_list = [
             self.EFFECT_SOLID,
             self.EFFECT_BREATH,
@@ -237,7 +288,8 @@ class LeproLedLight(LightEntity):
             self.EFFECT_LASER2,
             self.EFFECT_LASER3,
             self.EFFECT_LASER4,
-        ]
+        ]if self._caps.supports_special_effects else [self.EFFECT_SOLID]
+       
         # main light color is the first segment color
         self._attr_rgb_color = self._segment_colors[0]  # First segment as primary color
             
@@ -303,13 +355,13 @@ class LeproLedLight(LightEntity):
         if ATTR_RGB_COLOR in kwargs:
             self._attr_rgb_color = rgb_color
             # set all segment colors to the main color
-            self._segment_colors = [tuple(int(c) for c in rgb_color)] * 25
+            self._segment_colors = [tuple(int(c) for c in rgb_color)] * len(self._segment_colors)   
         
         if ATTR_EFFECT in kwargs:
             self._effect = effect
         
         # Send command based on effect
-        if effect in self.SPECIAL_EFFECTS:
+        if effect in self.SPECIAL_EFFECTS and self._caps.supports_special_effects:
             # special effects use d2=3 (d60)
             await self._send_special_effect_command(effect)
         else:
@@ -367,12 +419,12 @@ class LeproLedLight(LightEntity):
 
         # normalize/truncate/extend to ensure 25 segments
         total = sum(g[1] for g in groups)
-        if total != 25:
-            if total < 25:
-                groups[-1][1] += (25 - total)
+        if total != len(self._segment_colors):
+            if total < len(self._segment_colors):
+                groups[-1][1] += (len(self._segment_colors) - total)
             else:
-                while sum(g[1] for g in groups) > 25:
-                    excess = sum(g[1] for g in groups) - 25
+                while sum(g[1] for g in groups) > len(self._segment_colors):
+                    excess = sum(g[1] for g in groups) - len(self._segment_colors)
                     if groups[-1][1] > excess:
                         groups[-1][1] -= excess
                     else:
@@ -418,7 +470,19 @@ class LeproLedLight(LightEntity):
             # Reset to defaults
             self._effect = self.EFFECT_SOLID
             self._speed = 50
+            seg_count = len(self._segment_colors) or 1
 
+      # Non‑segmented devices: simple colour extraction
+            if not self._caps.segments:
+                match = re.search(r'([0-9A-F]{6})', d50_str)
+            if match:
+                hex_color = match.group(1)
+                r = int(hex_color[0:2], 16)
+                g = int(hex_color[2:4], 16)
+                b = int(hex_color[4:6], 16)
+                self._segment_colors = [(r, g, b)] * seg_count
+                self._attr_rgb_color = (r, g, b)
+        
             # Find P1000 block and F21000 marker
             p_idx = d50_str.find('P1000')
             if p_idx == -1:
@@ -429,7 +493,7 @@ class LeproLedLight(LightEntity):
                     r = int(hex_color[0:2], 16)
                     g = int(hex_color[2:4], 16)
                     b = int(hex_color[4:6], 16)
-                    self._segment_colors = [(r, g, b)] * 25
+                    self._segment_colors = [(r, g, b)] * len(self._segment_colors)
                     self._attr_rgb_color = (r, g, b)
                 # continue to parse effect below
             else:
@@ -475,13 +539,13 @@ class LeproLedLight(LightEntity):
                     segs.extend([col] * cnt)
 
                 # normalize to 25 segments
-                if len(segs) < 25:
+                if len(segs) < len(self._segment_colors):
                     if segs:
-                        segs.extend([segs[-1]] * (25 - len(segs)))
+                        segs.extend([segs[-1]] * (len(self._segment_colors) - len(segs)))
                     else:
-                        segs = [(255,255,255)] * 25
-                elif len(segs) > 25:
-                    segs = segs[:25]
+                        segs = [(255,255,255)] * len(self._segment_colors)
+                elif len(segs) > len(self._segment_colors):
+                    segs = segs[:len(self._segment_colors)]
 
                 self._segment_colors = segs
                 self._attr_rgb_color = self._segment_colors[0]
@@ -524,7 +588,7 @@ class LeproLedLight(LightEntity):
         except Exception as e:
             _LOGGER.error("Error parsing d50: %s", e)
             # fallback
-            self._segment_colors = [(255, 255, 255)] * 25
+            self._segment_colors = [(255, 255, 255)] * len(self._segment_colors)
             self._attr_rgb_color = (255, 255, 255)
             self._speed = 50
 
@@ -659,7 +723,7 @@ class LeproSegmentLight(LightEntity):
 
     @property
     def rgb_color(self):
-        segs = getattr(self._parent, "_segment_colors", [(255,255,255)]*25)
+        segs = getattr(self._parent, "_segment_colors", [(255,255,255)]*len(self._segment_colors))
         if len(segs) > self._index:
             return segs[self._index]
         return (255,255,255)
@@ -690,7 +754,7 @@ class LeproSegmentLight(LightEntity):
             # send updated d50 via parent
 
         try:
-            if self._parent._effect in self._parent.SPECIAL_EFFECTS:
+            if self._parent._effect in self._parent.SPECIAL_EFFECTS and self._parent._caps.supports_special_effects:
                 await self._parent._send_special_effect_command(self._parent._effect)
             else:
                 await self._parent._send_effect_command()
@@ -754,7 +818,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     mac = config_data["persistent_mac"]
     language = config_data.get("language", "it")
     fcm_token = config_data.get("fcm_token", "dfi8s76mRTCxRxm3UtNp2z:APA91bHWMEWKT9CgNfGJ961jot2qgfYdWePbO5sQLovSFDI7U_H-ulJiqIAB2dpZUUrhzUNWR3OE_eM83i9IDLk1a5ZRwHDxMA_TnGqdpE8H-0_JML8pBFA")
-    
+
+    # Read region from config (default to "eu" for backwards compatibility)
+    region = config_data.get("region", "eu")
+    api_host = REGIONS.get(region, REGIONS["eu"])
+
+    # Build URLs dynamically based on region
+    login_url = f"https://{api_host}{LOGIN_PATH}"
+    family_list_url = f"https://{api_host}{FAMILY_LIST_PATH}"
+    user_profile_url = f"https://{api_host}{USER_PROFILE_PATH}"
+    device_list_url = f"https://{api_host}{DEVICE_LIST_PATH}"
+
+    _LOGGER.info("Using Lepro API region: %s (%s)", region, api_host)
+
     # Update hass.data with the new config
     hass.data["lepro_led"][entry.entry_id] = config_data
     
@@ -770,7 +846,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
     async with aiohttp.ClientSession() as session:
         # 1) Login and get bearer token
-        bearer_token = await async_login(session, account, password, mac, language, fcm_token)
+        bearer_token = await async_login(session, account, password, mac, login_url, api_host, language, fcm_token)
         if bearer_token is None:
             _LOGGER.error("Failed to login to Lepro API")
             return
@@ -782,7 +858,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             "Device-Model": "custom_integration",
             "Device-System": "custom",
             "GMT": "+0",
-            "Host": "api-eu-iot.lepro.com",
+            "Host": api_host,
             "Language": language,
             "Platform": "2",
             "Screen-Size": "1536*2048",
@@ -791,7 +867,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         }
 
         # 2) Get user profile to find uid and MQTT info
-        user_url = USER_PROFILE_URL
+        user_url = user_profile_url
         timestamp = str(int(time.time()))
         headers["Timestamp"] = timestamp
         
@@ -817,7 +893,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
             return
 
         # 4) Get family list to find fid
-        family_url = FAMILY_LIST_URL.format(timestamp=timestamp)
+        family_url = family_list_url.format(timestamp=timestamp)
         async with session.get(family_url, headers=headers) as resp:
             if resp.status != 200:
                 _LOGGER.error("Failed to get family list from Lepro API")
@@ -832,7 +908,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
 
         # 5) Get device list by fid
         timestamp = str(int(time.time()))
-        device_url = DEVICE_LIST_URL.format(fid=fid, timestamp=timestamp)
+        device_url = device_list_url.format(fid=fid, timestamp=timestamp)
         headers["Timestamp"] = timestamp
 
         async with session.get(device_url, headers=headers) as resp:
@@ -880,20 +956,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
     entities = []
     device_entity_map = {}
     segments_map = {}
-    for device in devices:
-        entity = LeproLedLight(device, mqtt_client, entry.entry_id)
-        entities.append(entity)
-        device_entity_map[str(device['did'])] = entity
 
-        # If this is a segmented series (S1-5) create 25 segment lights
-        series = device.get("series", "") or ""
-        if "S1-5" in series:
-            segs = []
-            for idx in range(25):
-                seg_entity = LeproSegmentLight(entity, idx)
-                entities.append(seg_entity)
-                segs.append(seg_entity)
-            segments_map[str(device['did'])] = segs
+    for device in devices:
+        caps = build_capabilities(device)
+        entity = LeproLedLight(device, mqtt_client, entry.entry_id, caps)
+        entities.append(entity)
+    device_entity_map[str(device['did'])] = entity
+
+    if caps.segments > 0:
+        segs = []
+        for idx in range(caps.segments):
+            seg_entity = LeproSegmentLight(entity, idx)
+            entities.append(seg_entity)
+            segs.append(seg_entity)
+        segments_map[str(device['did'])] = segs
     
     # 9) Message handler
     # Update the message handler to process all relevant fields
